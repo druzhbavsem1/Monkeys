@@ -216,6 +216,19 @@ const TEAMS = {
 const FUR = "#7B4A2A", SKIN = "#E8C08F";
 const FX_LIFE = { splat: 5, splash: 0.7, hit: 0.5 };
 
+// Серверы, помогающие соединиться через офисные сети и роутеры
+const PEER_OPTS = {
+  config: {
+    iceServers: [
+      { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] },
+      { urls: "stun:openrelay.metered.ca:80" },
+      { urls: ["turn:openrelay.metered.ca:80", "turn:openrelay.metered.ca:443", "turn:openrelay.metered.ca:443?transport=tcp"],
+        username: "openrelayproject", credential: "openrelayproject" },
+    ],
+  },
+};
+const CONNECT_TIMEOUT_MS = 15000;
+
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
@@ -237,7 +250,7 @@ function setMsg(el, text, kind = "") { el.textContent = text; el.className = "ms
 function startHost(attempt = 0) {
   const code = randomCode();
   setMsg($("lobbyMsg"), "Создаю комнату…");
-  peer = new Peer(ID_PREFIX + code);
+  peer = new Peer(ID_PREFIX + code, PEER_OPTS);
 
   peer.on("open", () => {
     if (isHost) return;                       // повторное открытие после переподключения
@@ -310,14 +323,25 @@ function broadcastState() {
 function joinRoom(code) {
   code = code.trim().toUpperCase();
   if (code.length !== 5) { setMsg($("lobbyMsg"), "Код комнаты состоит из 5 символов.", "err"); return; }
-  setMsg($("lobbyMsg"), "Подключаюсь…");
-  peer = new Peer();
+  setMsg($("lobbyMsg"), "Связываюсь с сервером…");
+  $("joinBtn").disabled = true;
+  peer = new Peer(PEER_OPTS);
+  const fail = (text) => { if (!myId) { setMsg($("lobbyMsg"), text, "err"); $("joinBtn").disabled = false; } };
+  const timer = setTimeout(() => {
+    if (myId) return;
+    fail("Не удалось соединиться с хостом за 15 секунд. Проверьте код и что у хоста открыта вкладка с игрой. Если всё верно, вашу сеть блокирует брандмауэр: попробуйте с телефона через мобильный интернет.");
+    if (hostConn) hostConn.close();
+  }, CONNECT_TIMEOUT_MS);
 
   peer.on("open", () => {
+    setMsg($("lobbyMsg"), "Сервер ответил, соединяюсь с хостом…");
     hostConn = peer.connect(ID_PREFIX + code, { reliable: true });
-    hostConn.on("open", () => hostConn.send({ t: "join", name: playerName() }));
+    hostConn.on("open", () => {
+      setMsg($("lobbyMsg"), "Хост найден, вхожу в комнату…");
+      hostConn.send({ t: "join", name: playerName() });
+    });
     hostConn.on("data", (msg) => {
-      if (msg.t === "welcome") { myId = msg.id; enterGame(code); }
+      if (msg.t === "welcome") { clearTimeout(timer); myId = msg.id; enterGame(code); }
       else if (msg.t === "full") setMsg($("lobbyMsg"), `Комната заполнена: в игре уже ${MAX_PLAYERS} игроков.`, "err");
       else if (msg.t === "state") {
         snaps.push({ t: performance.now(), s: msg.state });
@@ -330,10 +354,14 @@ function joinRoom(code) {
   });
 
   peer.on("error", (err) => {
-    const text = err.type === "peer-unavailable"
-      ? "Комната с таким кодом не найдена. Проверьте код."
-      : "Ошибка соединения: " + err.type;
-    setMsg(myId ? $("gameMsg") : $("lobbyMsg"), text, "err");
+    const texts = {
+      "peer-unavailable": "Комната с таким кодом не найдена. Проверьте код: он действует, пока у хоста открыта вкладка с игрой.",
+      "network": "Нет связи с сервером PeerJS. Возможно, его блокирует ваша сеть.",
+      "server-error": "Сервер PeerJS недоступен. Попробуйте через минуту.",
+      "browser-incompatible": "Этот браузер не поддерживает WebRTC. Откройте игру в Chrome или Edge.",
+    };
+    const text = texts[err.type] || "Ошибка соединения: " + err.type;
+    if (myId) setMsg($("gameMsg"), text, "err"); else { clearTimeout(timer); fail(text); }
   });
 }
 
@@ -947,6 +975,9 @@ if (roomFromUrl) {
 if (typeof Peer === "undefined") {
   setMsg($("lobbyMsg"), "Не загрузилась библиотека PeerJS. Проверьте интернет или блокировщик рекламы.", "err");
 }
+window.addEventListener("beforeunload", (e) => {
+  if (isHost && clients.size) { e.preventDefault(); e.returnValue = ""; }
+});
 </script>
 </body>
 </html>
