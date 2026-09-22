@@ -9,6 +9,9 @@
 <link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@600;800&family=Rubik:wght@400;500;600&display=swap" rel="stylesheet">
 <!-- PeerJS: соединяет браузеры напрямую (WebRTC), сервер не нужен -->
 <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<!-- Firebase: запасной канал, если прямое соединение заблокировано сетью -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
 <style>
   :root {
     --bg: #E4EDDC; --card: #FFFFFF; --ink: #1E3A24; --ink-soft: #56705B; --line: #1E3A24;
@@ -227,7 +230,20 @@ const PEER_OPTS = {
     ],
   },
 };
-const CONNECT_TIMEOUT_MS = 15000;
+const CONNECT_TIMEOUT_MS = 10000;   // сколько ждать прямое соединение, прежде чем идти через сервер
+
+/* Запасной канал через Firebase (для сетей, где прямые соединения запрещены).
+   Вставьте сюда настройки своего проекта Firebase вместо null, например:
+   const FIREBASE_CONFIG = { apiKey: "AIza...", databaseURL: "https://xxx-default-rtdb.europe-west1.firebasedatabase.app", projectId: "xxx" }; */
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyB9FaBFEVfzUje0K26GeOGcdhqp2N2VpRo",
+  authDomain: "monkeys-b6a6c.firebaseapp.com",
+  databaseURL: "https://monkeys-b6a6c-default-rtdb.europe-west1.firebasedatabase.app",
+  projectId: "monkeys-b6a6c",
+  storageBucket: "monkeys-b6a6c.firebasestorage.app",
+  messagingSenderId: "7671804553",
+  appId: "1:7671804553:web:47b0c5bacc3580dc04cc58",
+};
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -251,14 +267,17 @@ function startHost(attempt = 0) {
   const code = randomCode();
   setMsg($("lobbyMsg"), "Создаю комнату…");
   peer = new Peer(ID_PREFIX + code, PEER_OPTS);
+  let hostTimer = null;
 
-  peer.on("open", () => {
+  const beginHosting = () => {
     if (isHost) return;                       // повторное открытие после переподключения
+    clearTimeout(hostTimer);
     isHost = true;
     myId = "host";
     state = createInitialState();
     addPlayer(myId, playerName());
     enterGame(code);
+    hostFirebase(code);
 
     let last = performance.now();
     setInterval(() => {
@@ -268,7 +287,16 @@ function startHost(attempt = 0) {
       while (dt > 0) { const step = Math.min(dt, 1 / 60); update(step); dt -= step; }
     }, 1000 / 60);
     setInterval(broadcastState, BROADCAST_MS);
-  });
+  };
+
+  // Если сервер PeerJS не отвечает, хостим только через Firebase
+  hostTimer = setTimeout(() => {
+    if (isHost) return;
+    if (fbInit()) { setMsg($("gameMsg"), "Прямые соединения недоступны, игра идёт через сервер.", ""); beginHosting(); }
+    else setMsg($("lobbyMsg"), "Не удалось связаться с сервером PeerJS, а Firebase не настроен.", "err");
+  }, CONNECT_TIMEOUT_MS);
+
+  peer.on("open", beginHosting);
 
   peer.on("connection", (conn) => {
     conn.on("data", (msg) => handleClientMessage(conn, msg));
@@ -279,9 +307,15 @@ function startHost(attempt = 0) {
 
   peer.on("error", (err) => {
     if (!isHost && err.type === "unavailable-id" && attempt < 3) {
+      clearTimeout(hostTimer);
       peer.destroy();
       startHost(attempt + 1);
+    } else if (!isHost && (err.type === "network" || err.type === "server-error") && fbInit()) {
+      clearTimeout(hostTimer);
+      beginHosting();
+      setMsg($("gameMsg"), "Прямые соединения недоступны, игра идёт через сервер.", "");
     } else if (!isHost) {
+      clearTimeout(hostTimer);
       setMsg($("lobbyMsg"), "Не удалось создать комнату: " + err.type, "err");
     } else {
       console.warn("PeerJS:", err.type);
@@ -315,9 +349,85 @@ function cleanInput(i) {
   return { move: clamp(Number(i.move) || 0, -1, 1), jump: !!i.jump, charging: !!i.charging };
 }
 
+let fbTick = 0;
 function broadcastState() {
   const msg = { t: "state", state: publicState() };
   for (const conn of clients.values()) if (conn.open) conn.send(msg);
+  // через Firebase шлём реже (10 раз в секунду) и только если такие игроки есть
+  if (fbRoomRef && fbClients.size && (++fbTick % 2 === 0)) fbRoomRef.child("state").set(msg.state);
+}
+
+/* ---------- Запасной канал через Firebase ---------- */
+let fbDb = null, fbRoomRef = null, fbMyRef = null, usingFb = false;
+let fbSideN = 0, fbThrowN = 0;
+const fbClients = new Map();      // у хоста: cid -> счётчики обработанных команд
+
+function fbInit() {
+  if (!FIREBASE_CONFIG || typeof firebase === "undefined") return false;
+  try {
+    if (!fbDb) { firebase.initializeApp(FIREBASE_CONFIG); fbDb = firebase.database(); }
+    return true;
+  } catch (e) { console.warn("Firebase:", e); return false; }
+}
+
+function hostFirebase(code) {
+  if (!fbInit()) return;
+  fbRoomRef = fbDb.ref("rooms/" + code);
+  fbRoomRef.onDisconnect().remove();
+  fbRoomRef.set({ host: firebase.database.ServerValue.TIMESTAMP });
+  const inRef = fbRoomRef.child("in");
+  inRef.on("child_added", (snap) => {
+    const cid = snap.key, d = snap.val() || {}, id = "fb_" + cid;
+    if (fbClients.has(cid) || state.players[id]) return;
+    if (Object.keys(state.players).length >= MAX_PLAYERS) { inRef.child(cid + "/full").set(true); return; }
+    fbClients.set(cid, { sideN: 0, thN: 0 });
+    addPlayer(id, String(d.name || "Мартышка").slice(0, 16));
+    applyFb(cid, d);
+  });
+  inRef.on("child_changed", (snap) => applyFb(snap.key, snap.val() || {}));
+  inRef.on("child_removed", (snap) => { fbClients.delete(snap.key); removePlayer("fb_" + snap.key); });
+}
+
+function applyFb(cid, d) {
+  const c = fbClients.get(cid), id = "fb_" + cid;
+  if (!c || !state.players[id]) return;
+  state.players[id].input = cleanInput(d.input);
+  if (d.sd && (d.sd.n || 0) > c.sideN) { c.sideN = d.sd.n; setSide(id, d.sd.s || null); }
+  if (d.th && (d.th.n || 0) > c.thN) { c.thN = d.th.n; tryThrow(id, Number(d.th.a), Number(d.th.p)); }
+}
+
+// Firebase не хранит пустые массивы и null, восстанавливаем их
+function fbNormalize(st) {
+  return {
+    players: st.players || {}, poops: st.poops || [], fx: st.fx || [], feed: st.feed || [],
+    score: st.score || { left: 0, right: 0 }, winner: st.winner || null, winT: st.winT || 0,
+  };
+}
+
+function joinViaFirebase(code, fail) {
+  if (!fbInit()) {
+    fail("Не удалось соединиться напрямую: вашу сеть блокирует брандмауэр, а запасной канал (Firebase) в игре не настроен.");
+    return;
+  }
+  setMsg($("lobbyMsg"), "Напрямую не получилось, подключаюсь через сервер…");
+  const room = fbDb.ref("rooms/" + code);
+  room.child("host").get().then((s) => {
+    if (!s.exists()) { fail("Комната с таким кодом не найдена. Проверьте код: он действует, пока у хоста открыта вкладка с игрой."); return; }
+    const cid = Math.random().toString(36).slice(2, 10), id = "fb_" + cid;
+    fbMyRef = room.child("in/" + cid);
+    fbMyRef.onDisconnect().remove();
+    fbMyRef.set({ name: playerName(), input: { move: 0, jump: false, charging: false } });
+    fbMyRef.child("full").on("value", (f) => {
+      if (f.val()) { fail(`Комната заполнена: в игре уже ${MAX_PLAYERS} игроков.`); fbMyRef.remove(); }
+    });
+    room.child("state").on("value", (snap) => {
+      const st = snap.val();
+      if (!st) { if (myId) setMsg($("gameMsg"), "Хост закрыл игру. Обновите страницу, чтобы начать заново.", "err"); return; }
+      const norm = fbNormalize(st);
+      if (!myId && norm.players[id]) { myId = id; usingFb = true; enterGame(code); setMsg($("gameMsg"), "Играете через сервер", ""); }
+      if (myId) { snaps.push({ t: performance.now(), s: norm }); if (snaps.length > 30) snaps.shift(); }
+    });
+  }).catch((e) => fail("Не удалось связаться с сервером: " + (e && e.message ? e.message : e)));
 }
 
 function joinRoom(code) {
@@ -326,55 +436,60 @@ function joinRoom(code) {
   setMsg($("lobbyMsg"), "Связываюсь с сервером…");
   $("joinBtn").disabled = true;
   peer = new Peer(PEER_OPTS);
+  let fallbackStarted = false;
   const fail = (text) => { if (!myId) { setMsg($("lobbyMsg"), text, "err"); $("joinBtn").disabled = false; } };
-  const timer = setTimeout(() => {
-    if (myId) return;
-    fail("Не удалось соединиться с хостом за 15 секунд. Проверьте код и что у хоста открыта вкладка с игрой. Если всё верно, вашу сеть блокирует брандмауэр: попробуйте с телефона через мобильный интернет.");
-    if (hostConn) hostConn.close();
-  }, CONNECT_TIMEOUT_MS);
+  const fallback = () => {
+    if (myId || fallbackStarted) return;
+    fallbackStarted = true;
+    clearTimeout(timer);
+    if (hostConn) { try { hostConn.close(); } catch (e) {} hostConn = null; }
+    joinViaFirebase(code, fail);
+  };
+  const timer = setTimeout(fallback, CONNECT_TIMEOUT_MS);
 
   peer.on("open", () => {
+    if (fallbackStarted) return;
     setMsg($("lobbyMsg"), "Сервер ответил, соединяюсь с хостом…");
     hostConn = peer.connect(ID_PREFIX + code, { reliable: true });
     hostConn.on("open", () => {
+      if (fallbackStarted) return;
       setMsg($("lobbyMsg"), "Хост найден, вхожу в комнату…");
       hostConn.send({ t: "join", name: playerName() });
     });
     hostConn.on("data", (msg) => {
+      if (fallbackStarted) return;
       if (msg.t === "welcome") { clearTimeout(timer); myId = msg.id; enterGame(code); }
-      else if (msg.t === "full") setMsg($("lobbyMsg"), `Комната заполнена: в игре уже ${MAX_PLAYERS} игроков.`, "err");
+      else if (msg.t === "full") { clearTimeout(timer); fail(`Комната заполнена: в игре уже ${MAX_PLAYERS} игроков.`); }
       else if (msg.t === "state") {
         snaps.push({ t: performance.now(), s: msg.state });
         if (snaps.length > 30) snaps.shift();
       }
     });
     hostConn.on("close", () => {
-      if (myId) setMsg($("gameMsg"), "Хост закрыл игру. Обновите страницу, чтобы начать заново.", "err");
+      if (myId && !usingFb) setMsg($("gameMsg"), "Хост закрыл игру. Обновите страницу, чтобы начать заново.", "err");
     });
   });
 
   peer.on("error", (err) => {
-    const texts = {
-      "peer-unavailable": "Комната с таким кодом не найдена. Проверьте код: он действует, пока у хоста открыта вкладка с игрой.",
-      "network": "Нет связи с сервером PeerJS. Возможно, его блокирует ваша сеть.",
-      "server-error": "Сервер PeerJS недоступен. Попробуйте через минуту.",
-      "browser-incompatible": "Этот браузер не поддерживает WebRTC. Откройте игру в Chrome или Edge.",
-    };
-    const text = texts[err.type] || "Ошибка соединения: " + err.type;
-    if (myId) setMsg($("gameMsg"), text, "err"); else { clearTimeout(timer); fail(text); }
+    if (myId) { console.warn("PeerJS:", err.type); return; }
+    if (["peer-unavailable", "network", "server-error", "browser-incompatible"].includes(err.type)) fallback();
+    else { clearTimeout(timer); fail("Ошибка соединения: " + err.type); }
   });
 }
 
 function sendInput(input) {
   if (isHost) { const p = state.players[myId]; if (p) p.input = { ...input }; }
+  else if (usingFb && fbMyRef) fbMyRef.update({ input });
   else if (hostConn && hostConn.open) hostConn.send({ t: "input", input });
 }
 function sendSide(side) {
   if (isHost) setSide(myId, side);
+  else if (usingFb && fbMyRef) fbMyRef.update({ sd: { n: ++fbSideN, s: side || null } });
   else if (hostConn && hostConn.open) hostConn.send({ t: "side", side });
 }
 function sendThrow(angle, power) {
   if (isHost) tryThrow(myId, angle, power);
+  else if (usingFb && fbMyRef) fbMyRef.update({ th: { n: ++fbThrowN, a: angle, p: power } });
   else if (hostConn && hostConn.open) hostConn.send({ t: "throw", angle, power });
 }
 
@@ -520,7 +635,7 @@ function publicState() {
 function getView() {
   if (isHost) return state ? publicState() : null;
   if (!snaps.length) return null;
-  const rt = performance.now() - INTERP_MS;
+  const rt = performance.now() - (usingFb ? 160 : INTERP_MS);
   let a = null, b = null;
   for (let i = snaps.length - 1; i >= 0; i--) {
     if (snaps[i].t <= rt) { a = snaps[i]; b = snaps[i + 1] || null; break; }
